@@ -1,0 +1,46 @@
+name: Compila APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Compila
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Prepara l'APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk TeleCast.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TeleCast-apk
+          path: TeleCast.apk
+
+      # L'APK va anche nella pagina "Releases": dal telefono basta toccarlo per scaricarlo.
+      - name: Pubblica l'APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view apk >/dev/null 2>&1; then
+            gh release upload apk TeleCast.apk --clobber
+          else
+            gh release create apk TeleCast.apk --title "TeleCast" --notes "Dal telefono tocca TeleCast.apk per scaricarlo e installarlo."
+          fi
