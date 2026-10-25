@@ -39,8 +39,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          VER=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          NOTES="Versione $VER. Dal telefono tocca TeleCast.apk per scaricarlo e installarlo: si installa sopra la versione precedente."
           if gh release view apk >/dev/null 2>&1; then
             gh release upload apk TeleCast.apk --clobber
+            gh release edit apk --title "TeleCast $VER" --notes "$NOTES"
           else
-            gh release create apk TeleCast.apk --title "TeleCast" --notes "Dal telefono tocca TeleCast.apk per scaricarlo e installarlo."
+            gh release create apk TeleCast.apk --title "TeleCast $VER" --notes "$NOTES"
           fi

@@ -31,6 +31,17 @@ Gli aggiornamenti si installano sopra la versione precedente (la chiave di firma
 
 Se una TV non compare: deve essere accesa e sulla stessa Wi-Fi (non quella "ospiti"); puoi anche inserire il suo IP a mano.
 
+## Blocco pubblicità
+
+Il browser di TeleCast blocca da solo pubblicità, pop-up e pagine spam:
+- **oltre 200.000 siti pubblicitari** (elenchi [HaGeZi](https://github.com/hagezi/dns-blocklists) Multi PRO + Pop-Up Ads, scaricati dall'app e aggiornati ogni 4 giorni; sui dati mobili solo se mancano);
+- **reindirizzamenti** verso altri siti che non partono da un link toccato davvero (il classico "tocchi Play e si apre un sito spam"), anche dagli strati trasparenti messi sopra il video;
+- **pop-up** verso altri siti, finestre "Hai vinto!", richieste di permessi, download di app e link che aprono altre app.
+
+Lo **scudo** in alto mostra quante cose ha bloccato sulla pagina. Se qualcosa che serviva viene bloccato, tocca **Apri** nell'avviso (o lo scudo → *Bloccati di recente*). Se un sito non funziona, scudo → **Disattiva qui** (solo per quel sito).
+
+Per i siti con tanti pop-up conviene aprirli direttamente in TeleCast invece che da Chrome.
+
 ## Se qualcosa non va
 
 - **Il video non parte sulla LG**: l'app prova da sola più modalità (flusso unico "compatibilità", poi HLS nativo). Dal telecomando puoi forzare **Prova l'altra modalità**, oppure spostarlo sull'altra TV.
@@ -53,7 +64,8 @@ Chrome ──Condividi──▶ TeleCast (browser interno)
 ```
 
 - `core/` (Kotlin puro, testato su JVM con una LG e un Chromecast simulati): scoperta SSDP e mDNS, comandi DLNA, protocollo Cast v2, proxy HTTP con Range e CORS, riscrittura HLS, unione dei segmenti in MPEG-TS, tentativi automatici, spostamento tra TV.
-- `BrowserActivity`, `DevicePicker`, `RemoteActivity`, `CastService`: interfaccia, scelta della TV, telecomando e servizio in primo piano.
-- `dev/`: banco di prova (sito, LG e Chromecast finti in Python + test Kotlin), istruzioni in `dev/LEGGIMI.md`.
+- `core/AdFilter.kt`: blocco pubblicità (elenco compatto di hash, aggiornamento con fonti di riserva, regole contro reindirizzamenti e pop-up).
+- `BrowserActivity`, `Shield`, `DevicePicker`, `RemoteActivity`, `CastService`: interfaccia, blocco pubblicità, scelta della TV, telecomando e servizio in primo piano.
+- `dev/`: banco di prova (sito, LG e Chromecast finti in Python + test Kotlin e JavaScript), istruzioni in `dev/LEGGIMI.md`.
 
-Icone: Material Design Icons (Apache 2.0).
+Icone: Material Design Icons (Apache 2.0). Elenchi pubblicitari: HaGeZi DNS Blocklists (GPL-3.0), scaricati dall'app al primo avvio e non inclusi nel progetto.

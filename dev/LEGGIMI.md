@@ -12,3 +12,23 @@ python3 dev/fake_cast.py /tmp/c.pem /tmp/k.pem &
 kotlinc app/src/main/java/it/telecast/core/*.kt dev/CoreTest.kt -d /tmp/out
 kotlin -cp /tmp/out test.CoreTestKt
 ```
+
+## Blocco pubblicità
+
+```bash
+# motore: formati degli elenchi, aggiornamento con fonti di riserva, regole su reindirizzamenti e pop-up
+kotlinc app/src/main/java/it/telecast/core/*.kt dev/AdFilterTest.kt -d /tmp/ad
+# facoltativo: prova anche con gli elenchi veri (pro.txt e popup.txt in una cartella)
+curl -o /tmp/l/pro.txt --create-dirs https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt
+curl -o /tmp/l/popup.txt https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt
+kotlin -cp /tmp/ad testad.AdFilterTestKt /tmp/l
+```
+
+Script iniettati nelle pagine (link toccati, strati trasparenti, riquadri pubblicitari), provati in Chromium con Playwright:
+
+```bash
+# estrae gli script dall'app compilata (serve android.jar per compilare BrowserActivity)
+kotlinc -cp android.jar app/src/main/java dev/DumpScripts.kt -d /tmp/js
+kotlin -cp /tmp/js:android.jar DumpScriptsKt /tmp/js
+node dev/shield_test.js /tmp/js
+```

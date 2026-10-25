@@ -39,6 +39,7 @@ class App : Application() {
         }
         cast.listener = { st -> main.post { for (l in statusListeners) l(st) } }
         Log.i("App", "avvio su Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}")
+        AdBlock.init(this)
     }
 
     /** Il listener riceve subito lo stato attuale e poi ogni cambiamento, sempre sul thread principale. */
@@ -124,5 +125,14 @@ object Prefs {
 
     fun setAskedNotifications(c: Context) {
         sp(c).edit().putBoolean("asked_notif", true).apply()
+    }
+
+    /** Siti su cui l'utente ha spento il blocco pubblicità. */
+    fun shieldOffSites(c: Context): Set<String> = HashSet(sp(c).getStringSet("shield_off", emptySet()) ?: emptySet())
+
+    fun setShieldOff(c: Context, site: String, off: Boolean) {
+        val set = shieldOffSites(c).toMutableSet()
+        if (off) set += site else set -= site
+        sp(c).edit().putStringSet("shield_off", set).apply()
     }
 }

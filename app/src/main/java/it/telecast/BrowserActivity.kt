@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Message
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.InputType
 import android.text.TextUtils
@@ -24,7 +25,11 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
+import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
+import android.webkit.JsPromptResult
+import android.webkit.JsResult
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -48,13 +53,18 @@ import it.telecast.core.Log
 import it.telecast.core.MediaDetector
 import it.telecast.core.MediaKind
 import it.telecast.core.MediaSource
+import it.telecast.core.NavShield
 import it.telecast.core.PlayState
 import it.telecast.core.Renderer
+import it.telecast.core.Sites
 import org.json.JSONArray
 import java.io.ByteArrayInputStream
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Schermata principale: un browser che intercetta i video delle pagine.
@@ -73,13 +83,27 @@ class BrowserActivity : Activity() {
     private lateinit var nowTitle: TextView
     private lateinit var nowSub: TextView
     private lateinit var nowBtn: ImageButton
+    private lateinit var shieldIcon: ImageView
+    private lateinit var shieldBadge: TextView
+    private lateinit var blockedBar: BlockedBar
 
     @Volatile private var pageUrl: String? = null
     @Volatile private var pageTitle: String = ""
     @Volatile private var userAgent: String = Http.DEFAULT_UA
     private var lastCount = 0
-    private var lastBlockedPopup: String? = null
     private val checkedCandidates = ConcurrentHashMap.newKeySet<String>()
+
+    // blocco pubblicità
+    @Volatile private var pageSite: String = ""
+    @Volatile private var lastTap: NavShield.Tap? = null
+    @Volatile private var lastAllowedAt = 0L
+    @Volatile private var shieldOffSites: Set<String> = emptySet()
+    private val stats = ShieldStats()
+    private val recentBlocked = ArrayList<BlockedItem>()
+    private val shieldUiPending = AtomicBoolean(false)
+
+    /** Nome del ponte JavaScript diverso a ogni avvio: le pubblicità non possono indovinarlo. */
+    private val bridgeName = "tc" + UUID.randomUUID().toString().replace("-", "").take(12)
 
     private val scanTask = object : Runnable {
         override fun run() {
@@ -92,6 +116,7 @@ class BrowserActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        shieldOffSites = Prefs.shieldOffSites(this)
         val root = buildLayout()
         setContentView(root)
         Edge.apply(this, root)
@@ -183,6 +208,7 @@ class BrowserActivity : Activity() {
             }
         }
         top.addView(urlBar, lp(0, WRAP, 1f, l = dp(4), r = dp(4)))
+        top.addView(buildShieldButton(), LinearLayout.LayoutParams(dp(44), dp(44)))
         top.addView(iconButton(R.drawable.ic_refresh, C.TEXT, "Ricarica").apply { setOnClickListener { web.reload() } })
         val more = iconButton(R.drawable.ic_more, C.TEXT, "Menu")
         more.setOnClickListener { showMenu(more) }
@@ -204,6 +230,11 @@ class BrowserActivity : Activity() {
         content.addView(
             fab,
             FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.END).apply { setMargins(dp(16), dp(16), dp(16), dp(20)) },
+        )
+        blockedBar = BlockedBar(this)
+        content.addView(
+            blockedBar,
+            FrameLayout.LayoutParams(MATCH, WRAP, Gravity.TOP).apply { setMargins(dp(10), dp(8), dp(10), 0) },
         )
         root.addView(content, lp(MATCH, 0, 1f))
 
@@ -235,6 +266,52 @@ class BrowserActivity : Activity() {
         }
         f.addView(fabBadge, LinearLayout.LayoutParams(WRAP, dp(22)))
         return f
+    }
+
+    /** Scudo nella barra in alto: il numero è quanto ha bloccato sulla pagina. */
+    private fun buildShieldButton(): View {
+        val f = FrameLayout(this).apply {
+            background = rippleOval()
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Blocco pubblicità"
+            setOnClickListener { showShieldDialog() }
+        }
+        shieldIcon = ImageView(this).apply {
+            setImageResource(R.drawable.ic_shield)
+            imageTintList = ColorStateList.valueOf(C.ACCENT)
+        }
+        f.addView(shieldIcon, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+        shieldBadge = label("", 9f, C.ON_ACCENT, bold = true).apply {
+            gravity = Gravity.CENTER
+            minWidth = dp(16)
+            setPadding(dp(3), 0, dp(3), 0)
+            background = roundRect(C.ACCENT, dpf(8f))
+            visibility = View.GONE
+        }
+        f.addView(shieldBadge, FrameLayout.LayoutParams(WRAP, dp(16), Gravity.TOP or Gravity.END).apply { setMargins(0, dp(3), dp(1), 0) })
+        return f
+    }
+
+    private fun shieldOn(): Boolean = pageSite.isEmpty() || pageSite !in shieldOffSites
+
+    private fun updateShieldUi() {
+        val on = shieldOn()
+        shieldIcon.imageTintList = ColorStateList.valueOf(if (on) C.ACCENT else C.DIM)
+        shieldIcon.alpha = if (on) 1f else 0.6f
+        val n = stats.total
+        shieldBadge.visibility = if (on && n > 0) View.VISIBLE else View.GONE
+        shieldBadge.text = if (n > 99) "99+" else n.toString()
+    }
+
+    /** Dai thread della WebView: aggiorna il contatore al massimo ogni 300 ms. */
+    private fun scheduleShieldUi() {
+        if (shieldUiPending.compareAndSet(false, true)) {
+            app.main.postDelayed({
+                shieldUiPending.set(false)
+                updateShieldUi()
+            }, 300)
+        }
     }
 
     private fun updateFab() {
@@ -315,12 +392,13 @@ class BrowserActivity : Activity() {
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = false
         s.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        s.safeBrowsingEnabled = true
         // ci presentiamo come Chrome: alcuni siti trattano male le WebView
         s.userAgentString = s.userAgentString.replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+ "), "")
         userAgent = s.userAgentString
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
-        web.addJavascriptInterface(Bridge(), "TeleCastBridge")
+        web.addJavascriptInterface(Bridge(), bridgeName)
         web.webViewClient = Client()
         web.webChromeClient = Chrome()
         web.setDownloadListener { url, _, _, mimetype, _ -> onDownload(url, mimetype) }
@@ -328,9 +406,15 @@ class BrowserActivity : Activity() {
 
     private inner class Client : WebViewClient() {
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+            if (request.isForMainFrame) return null
             val host = request.url.host?.lowercase(Locale.ROOT) ?: ""
-            if (AdBlock.isBlocked(host)) return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
-            if (!request.isForMainFrame) onResource(request.url.toString(), request.requestHeaders ?: emptyMap())
+            // le risorse del sito stesso passano sempre; quelle dei circuiti pubblicitari no
+            if (host.isNotEmpty() && shieldOn() && Sites.of(host) != pageSite && AdBlock.isBlocked(host)) {
+                stats.ads.incrementAndGet()
+                scheduleShieldUi()
+                return emptyResponse()
+            }
+            onResource(request.url.toString(), request.requestHeaders ?: emptyMap())
             return null
         }
 
@@ -339,18 +423,31 @@ class BrowserActivity : Activity() {
             val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: return false
             if (scheme != "http" && scheme != "https") {
                 if (scheme == "about" || scheme == "data" || scheme == "blob" || scheme == "javascript") return false
+                // intent://, market://, app esterne: sui siti di streaming sono quasi sempre pubblicità
                 Log.d(TAG, "link $scheme: ignorato")
                 return true
             }
             if (!request.isForMainFrame) return false
-            if (AdBlock.isBlocked(uri.host?.lowercase(Locale.ROOT) ?: "")) {
-                toast("Pubblicità bloccata")
-                return true
+            val url = uri.toString()
+            val now = SystemClock.elapsedRealtime()
+            if (shieldOn()) {
+                when (NavShield.decide(url, pageUrl, request.isRedirect, lastTap, lastAllowedAt, now, AdBlock::isBlocked)) {
+                    NavShield.Verdict.AD -> {
+                        noteBlocked(url, "Pagina pubblicitaria bloccata", stats.redirects)
+                        return true
+                    }
+                    NavShield.Verdict.UNWANTED -> {
+                        noteBlocked(url, "Reindirizzamento bloccato", stats.redirects)
+                        return true
+                    }
+                    NavShield.Verdict.ALLOW -> Unit
+                }
             }
-            val kind = MediaDetector.classify(uri.toString())
+            lastAllowedAt = now
+            val kind = MediaDetector.classify(url)
             if (kind != null) {
                 // link diretto a un video: invece di aprirlo lo metto nell'elenco
-                addSource(uri.toString(), kind, emptyMap())
+                addSource(url, kind, emptyMap())
                 toast("Video trovato: tocca Trasmetti")
                 return true
             }
@@ -358,8 +455,14 @@ class BrowserActivity : Activity() {
         }
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-            pageUrl = url.takeIf { it.startsWith("http") }
-            setUrlBar(url)
+            setPage(url)
+            stats.reset()
+            updateShieldUi()
+            injectShield()
+        }
+
+        override fun onPageCommitVisible(view: WebView, url: String) {
+            injectShield()
         }
 
         override fun onPageFinished(view: WebView, url: String) {
@@ -369,9 +472,40 @@ class BrowserActivity : Activity() {
         }
 
         override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
-            pageUrl = url.takeIf { it.startsWith("http") }
-            setUrlBar(url)
+            setPage(url)
         }
+    }
+
+    private fun setPage(url: String) {
+        pageUrl = url.takeIf { it.startsWith("http") }
+        pageSite = Sites.ofUrl(pageUrl)
+        setUrlBar(url)
+    }
+
+    private fun emptyResponse() = WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+
+    /** Registra un blocco e mostra l'avviso con "Apri", nel caso servisse davvero. */
+    private fun noteBlocked(url: String, what: String, counter: AtomicInteger) {
+        counter.incrementAndGet()
+        val host = Sites.hostOf(url).removePrefix("www.")
+        Log.i(TAG, "$what: ${url.take(120)}")
+        recentBlocked.removeAll { it.url == url }
+        recentBlocked.add(BlockedItem(url, what))
+        while (recentBlocked.size > 6) recentBlocked.removeAt(0)
+        blockedBar.show("$what · $host") { openBlocked(url) }
+        updateShieldUi()
+    }
+
+    private fun openBlocked(url: String) {
+        val kind = MediaDetector.classify(url)
+        if (kind != null) {
+            addSource(url, kind, emptyMap())
+            toast("Video trovato: tocca Trasmetti")
+            return
+        }
+        Log.i(TAG, "aperto su richiesta: ${url.take(120)}")
+        lastAllowedAt = SystemClock.elapsedRealtime()
+        web.loadUrl(url)
     }
 
     private inner class Chrome : WebChromeClient() {
@@ -385,11 +519,19 @@ class BrowserActivity : Activity() {
         }
 
         /**
-         * Nuove finestre: quelle aperte da un tocco e dello stesso sito (spesso il player) si aprono qui;
-         * le altre sono quasi sempre pubblicità e vengono bloccate (restano apribili dal menu).
+         * Nuove finestre: si aprono qui solo il link toccato davvero o una pagina dello stesso sito
+         * (spesso il player); le altre sono quasi sempre pubblicità e vengono bloccate.
+         * Alla pagina si dà comunque una finestra finta: così lo script pubblicitario si crede
+         * soddisfatto e al tocco successivo parte il video.
          */
         override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
+            val on = shieldOn()
             if (!isUserGesture) {
+                // come Chrome: le finestre aperte senza un tocco non si aprono mai
+                if (on) {
+                    stats.popups.incrementAndGet()
+                    scheduleShieldUi()
+                }
                 Log.d(TAG, "pop-up automatico bloccato")
                 return false
             }
@@ -398,25 +540,33 @@ class BrowserActivity : Activity() {
             fun take(url: String) {
                 if (handled || url.isBlank() || url.startsWith("about:")) return
                 handled = true
-                val host = Uri.parse(url).host?.lowercase(Locale.ROOT) ?: ""
-                val sameSite = pageUrl?.let { siteOf(Uri.parse(it).host) == siteOf(host) } ?: false
-                when {
-                    AdBlock.isBlocked(host) -> toast("Pubblicità bloccata")
-                    MediaDetector.classify(url) != null -> addSource(url, MediaDetector.classify(url)!!, emptyMap())
-                    sameSite -> web.loadUrl(url)
-                    else -> {
-                        lastBlockedPopup = url
-                        Log.i(TAG, "pop-up bloccato: ${url.take(120)}")
-                        toast("Pop-up bloccato (se serviva, aprilo dal menu ⋮)")
-                    }
-                }
                 app.main.post { temp.destroy() }
+                val now = SystemClock.elapsedRealtime()
+                val verdict = if (on) NavShield.popup(url, pageUrl, AdBlock::isBlocked) else NavShield.Popup.OPEN_HERE
+                val media = MediaDetector.classify(url)
+                when {
+                    verdict == NavShield.Popup.SAME_PAGE -> {
+                        stats.popups.incrementAndGet()
+                        updateShieldUi()
+                        Log.d(TAG, "pop-under ignorato: ${url.take(120)}")
+                    }
+                    verdict == NavShield.Popup.AD -> noteBlocked(url, "Pop-up pubblicitario bloccato", stats.popups)
+                    media != null -> addSource(url, media, emptyMap())
+                    verdict == NavShield.Popup.OPEN_HERE -> {
+                        lastAllowedAt = now
+                        web.loadUrl(url)
+                    }
+                    else -> noteBlocked(url, "Pop-up bloccato", stats.popups)
+                }
             }
             temp.webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
                     take(r.url.toString())
                     return true
                 }
+
+                // la finestra finta non scarica nulla
+                override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse = emptyResponse()
 
                 override fun onPageStarted(v: WebView, url: String, favicon: Bitmap?) {
                     take(url)
@@ -432,18 +582,44 @@ class BrowserActivity : Activity() {
             }, 5000)
             return true
         }
+
+        // "Hai vinto un iPhone!" e simili: con il blocco attivo le finestre di avviso delle pagine non compaiono
+        override fun onJsAlert(view: WebView, url: String?, message: String?, result: JsResult): Boolean {
+            if (!shieldOn()) return false
+            Log.i(TAG, "avviso della pagina nascosto: ${message?.take(80)}")
+            result.confirm()
+            return true
+        }
+
+        override fun onJsConfirm(view: WebView, url: String?, message: String?, result: JsResult): Boolean {
+            if (!shieldOn()) return false
+            Log.i(TAG, "domanda della pagina rifiutata: ${message?.take(80)}")
+            result.cancel()
+            return true
+        }
+
+        override fun onJsPrompt(view: WebView, url: String?, message: String?, defaultValue: String?, result: JsPromptResult): Boolean {
+            if (!shieldOn()) return false
+            result.cancel()
+            return true
+        }
+
+        // niente "Vuoi davvero lasciare la pagina?": si esce sempre
+        override fun onJsBeforeUnload(view: WebView, url: String?, message: String?, result: JsResult): Boolean {
+            result.confirm()
+            return true
+        }
+
+        override fun onPermissionRequest(request: PermissionRequest) {
+            request.deny()
+        }
+
+        override fun onGeolocationPermissionsShowPrompt(origin: String?, callback: GeolocationPermissions.Callback?) {
+            callback?.invoke(origin, false, false)
+        }
     }
 
-    /** "player.sito.co.uk" -> "sito.co.uk", "www.sito.it" -> "sito.it". */
-    private fun siteOf(host: String?): String {
-        val h = (host ?: "").lowercase(Locale.ROOT).removePrefix("www.")
-        val parts = h.split('.')
-        if (parts.size <= 2) return h
-        val keep = if (parts[parts.size - 2].length <= 3 && parts.last().length == 2) 3 else 2
-        return parts.takeLast(keep).joinToString(".")
-    }
-
-    /** Ponte JavaScript: lo script di scansione segnala i <video> presenti nella pagina. */
+    /** Ponte JavaScript: video trovati nella pagina, link toccati, controllo dei riquadri pubblicitari. */
     private inner class Bridge {
         @JavascriptInterface
         fun found(json: String, page: String, title: String) {
@@ -461,6 +637,21 @@ class BrowserActivity : Activity() {
                 }
             }
         }
+
+        /** L'utente ha toccato un link vero (overlay = era uno strato trasparente sopra la pagina). */
+        @JavascriptInterface
+        fun tap(url: String, overlay: Boolean) {
+            lastTap = NavShield.Tap(url, SystemClock.elapsedRealtime(), overlay)
+        }
+
+        @JavascriptInterface
+        fun blocked(host: String): Boolean = shieldOn() && Sites.of(host) != pageSite && AdBlock.isBlocked(host)
+    }
+
+    /** Lo script dello scudo va rimesso a ogni pagina (non si duplica: controlla se c'è già). */
+    private fun injectShield() {
+        val u = web.url ?: return
+        if (u.startsWith("http") && shieldOn()) web.evaluateJavascript(shieldJs(bridgeName), null)
     }
 
     /** Chiamato per ogni richiesta della pagina (su un thread della WebView). */
@@ -504,7 +695,9 @@ class BrowserActivity : Activity() {
 
     private fun scanVideos() {
         val u = web.url ?: return
-        if (u.startsWith("http")) web.evaluateJavascript(SCAN_JS, null)
+        if (!u.startsWith("http")) return
+        if (shieldOn()) web.evaluateJavascript(shieldJs(bridgeName) + sweepJs(bridgeName), null)
+        web.evaluateJavascript(scanJs(bridgeName), null)
     }
 
     private fun onDownload(url: String, mime: String?) {
@@ -518,7 +711,9 @@ class BrowserActivity : Activity() {
             addSource(url, kind, emptyMap())
             toast("Video trovato: tocca Trasmetti")
         } else {
-            toast("Questo file non è un video")
+            // file da scaricare che non sono video: sui siti di streaming sono quasi sempre app o "codec" truffa
+            Log.i(TAG, "download ignorato ($m): ${url.take(120)}")
+            blockedBar.show("Download bloccato · ${Sites.hostOf(url).removePrefix("www.")}", null)
         }
     }
 
@@ -545,6 +740,7 @@ class BrowserActivity : Activity() {
         checkedCandidates.clear()
         lastCount = 0
         pageTitle = ""
+        lastAllowedAt = SystemClock.elapsedRealtime()
         web.loadUrl(url)
         setUrlBar(url)
     }
@@ -605,8 +801,8 @@ class BrowserActivity : Activity() {
         pm.menu.add(0, 3, 2, "Telecomando")
         pm.menu.add(0, 4, 3, "Pagina iniziale")
         pm.menu.add(0, 5, 4, "Funziona a schermo spento")
-        pm.menu.add(0, 6, 5, "Log diagnostico")
-        lastBlockedPopup?.let { pm.menu.add(0, 7, 6, "Apri il pop-up bloccato") }
+        pm.menu.add(0, 7, 5, "Blocco pubblicità")
+        pm.menu.add(0, 6, 6, "Log diagnostico")
         pm.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> showMediaSheet()
@@ -615,14 +811,75 @@ class BrowserActivity : Activity() {
                 4 -> showStartPage()
                 5 -> askBatteryExemption()
                 6 -> LogDialog.show(this)
-                7 -> lastBlockedPopup?.let {
-                    lastBlockedPopup = null
-                    web.loadUrl(it)
-                }
+                7 -> showShieldDialog()
             }
             true
         }
         pm.show()
+    }
+
+    private fun showShieldDialog() {
+        val site = pageSite
+        val off = site.isNotEmpty() && !shieldOn()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(4), dp(24), dp(4))
+        }
+        val pageLine = when {
+            site.isEmpty() -> "Blocca pubblicità, pop-up e pagine spam sui siti che apri qui."
+            off -> "Disattivato su $site."
+            else -> stats.describe()
+        }
+        box.addView(label(pageLine, 15f, C.TEXT))
+        box.addView(label(AdBlock.describe(), 13f, C.DIM).apply { setPadding(0, dp(10), 0, 0) })
+        var dlg: AlertDialog? = null
+        if (recentBlocked.isNotEmpty()) {
+            box.addView(label("Bloccati di recente: tocca per aprirli se servivano", 12f, C.DIM, bold = true).apply { setPadding(0, dp(18), 0, dp(6)) })
+            for (item in recentBlocked.asReversed()) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(12), dp(10), dp(12), dp(10))
+                    background = rippleRect(C.SURFACE2, dpf(12f))
+                    isClickable = true
+                    setOnClickListener {
+                        dlg?.dismiss()
+                        openBlocked(item.url)
+                    }
+                }
+                row.addView(label(Sites.hostOf(item.url).removePrefix("www."), 14f, C.TEXT, bold = true).apply {
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                })
+                row.addView(label(item.what, 12f, C.DIM))
+                box.addView(row, lp(MATCH, WRAP, b = dp(6)))
+            }
+        }
+        val b = dialog()
+            .setTitle("Blocco pubblicità")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Chiudi", null)
+            .setNegativeButton("Aggiorna elenco") { _, _ ->
+                if (AdBlock.updating) {
+                    toast("Aggiornamento già in corso")
+                } else {
+                    toast("Aggiorno l'elenco…")
+                    AdBlock.updateNow(app) { ok ->
+                        toast(if (ok) "Elenco aggiornato: ${AdBlock.number(AdBlock.size)} siti" else "Aggiornamento non riuscito: riprovo più tardi")
+                    }
+                }
+            }
+        if (site.isNotEmpty()) b.setNeutralButton(if (off) "Riattiva qui" else "Disattiva qui") { _, _ -> setShieldOff(site, !off) }
+        dlg = b.show()
+    }
+
+    /** Se un sito non funziona col blocco attivo, lo si spegne solo lì. */
+    private fun setShieldOff(site: String, off: Boolean) {
+        Prefs.setShieldOff(this, site, off)
+        shieldOffSites = Prefs.shieldOffSites(this)
+        stats.reset()
+        updateShieldUi()
+        toast(if (off) "Blocco pubblicità disattivato su $site" else "Blocco pubblicità riattivato su $site")
+        web.reload()
     }
 
     private fun pickTv() {
@@ -648,7 +905,7 @@ class BrowserActivity : Activity() {
             .setTitle("Nessun video trovato")
             .setMessage(
                 "Fai partire il video nella pagina (basta un secondo): l'app lo intercetta e il pulsante diventa giallo.\n\n" +
-                    "Se si aprono pubblicità o finestre, chiudile e premi di nuovo Play.\n\n" +
+                    "Se al primo tocco non parte, tocca di nuovo Play: spesso il primo tocco apre una pubblicità, che l'app blocca.\n\n" +
                     "I servizi protetti da DRM (Netflix, Prime Video, Disney+…) non si possono trasmettere così.",
             )
             .setPositiveButton("Ok", null)
@@ -784,11 +1041,40 @@ class BrowserActivity : Activity() {
         private const val TAG = "Browser"
         private val URL_RE = Regex("""https?://[^\s"'<>]+""")
 
-        private const val SCAN_JS =
-            "(function(){try{var r=[];function a(s){if(s&&typeof s==='string'&&s.indexOf('http')===0&&r.indexOf(s)<0)r.push(s)}" +
+        /** Cerca i <video> della pagina e li segnala all'app. */
+        fun scanJs(b: String) =
+            "(function(B){try{var r=[];function a(s){if(s&&typeof s==='string'&&s.indexOf('http')===0&&r.indexOf(s)<0)r.push(s)}" +
                 "document.querySelectorAll('video,audio').forEach(function(v){a(v.currentSrc);a(v.src);" +
                 "v.querySelectorAll('source').forEach(function(x){a(x.src)})});" +
-                "if(r.length&&window.TeleCastBridge)TeleCastBridge.found(JSON.stringify(r),location.href,document.title||'')}catch(e){}})();"
+                "if(r.length&&B)B.found(JSON.stringify(r),location.href,document.title||'')}catch(e){}})(window['$b']);"
+
+        /**
+         * Registra i link toccati davvero dall'utente (non i clic simulati dagli script):
+         * così l'app distingue un link vero da una pubblicità che porta via la pagina.
+         * Un elemento grande, vuoto o trasparente sopra la pagina è uno strato pubblicitario.
+         */
+        fun shieldJs(b: String) =
+            "(function(B){if(!B||window['_$b'])return;window['_$b']=1;" +
+                "function ov(el){try{if(!el||el.nodeType!==1)return false;" +
+                "if(/^(IMG|VIDEO|PICTURE|CANVAS|IFRAME|SVG)${'$'}/i.test(el.tagName))return false;" +
+                "var r=el.getBoundingClientRect();if(r.width*r.height<0.35*Math.max(innerWidth,1)*Math.max(innerHeight,1))return false;" +
+                "var cs=getComputedStyle(el);if(parseFloat(cs.opacity)<0.15)return true;" +
+                "if((el.textContent||'').trim())return false;if(el.querySelector('img,video,picture,svg,canvas,iframe'))return false;" +
+                "return !cs.backgroundImage||cs.backgroundImage==='none'}catch(e){return false}}" +
+                "function link(e){var p=e.composedPath?e.composedPath():[];for(var i=0;i<p.length;i++){var n=p[i];" +
+                "if(n&&(n.tagName==='A'||n.tagName==='AREA')&&n.href)return n}" +
+                "var t=e.target;return t&&t.closest?t.closest('a[href],area[href]'):null}" +
+                "window.addEventListener('click',function(e){if(!e.isTrusted)return;var a=link(e);if(!a)return;" +
+                "var t=e.target;B.tap(String(a.href),ov(a)||(t!==a&&ov(t)))},true);" +
+                "window.addEventListener('submit',function(e){var f=e.target;if(e.isTrusted&&f&&f.action)B.tap(String(f.action),false)},true);" +
+                "})(window['$b']);"
+
+        /** Nasconde i riquadri pubblicitari rimasti vuoti (iframe di siti in elenco). */
+        fun sweepJs(b: String) =
+            "(function(B){if(!B)return;try{var fs=document.getElementsByTagName('iframe');for(var i=0;i<fs.length;i++){" +
+                "var f=fs[i],s=f.src||'';if(s.indexOf('http')!==0||f.__tcs===s)continue;f.__tcs=s;var h='';" +
+                "try{h=new URL(s).hostname}catch(e){}if(h&&B.blocked(h))f.style.setProperty('display','none','important')}}catch(e){}" +
+                "})(window['$b']);"
 
         private val START_HTML = """<!doctype html><html lang="it"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -806,34 +1092,10 @@ small{display:block;color:#9AA0AB;margin-top:22px;line-height:1.5}
 <h1>Tele<span>Cast</span></h1>
 <p>I video dei siti sulle tue TV (LG, ok. Google TV e altre), senza mirroring.</p>
 <form action="https://www.google.com/search"><input name="q" placeholder="Cerca un sito o un film" autocomplete="off"><button>Vai</button></form>
-<div class="s"><div class="n">1</div><div>Apri il sito qui, oppure da Chrome tocca <b>Condividi &rarr; TeleCast</b>.</div></div>
+<div class="s"><div class="n">1</div><div>Apri il sito qui: <b>pubblicità, pop-up e pagine spam vengono bloccati</b>. Da Chrome puoi anche toccare <b>Condividi &rarr; TeleCast</b>.</div></div>
 <div class="s"><div class="n">2</div><div>Fai partire il video nella pagina: l'app lo intercetta.</div></div>
 <div class="s"><div class="n">3</div><div>Tocca il pulsante giallo <b>Trasmetti</b> e scegli la TV.</div></div>
 <small>Il telefono fa da telecomando: puoi bloccarlo, la TV continua. Non funziona con i servizi protetti da DRM (Netflix, Prime Video, Disney+).</small>
 </body></html>"""
-    }
-}
-
-/** Blocco pubblicità di base: i circuiti più comuni sui siti di streaming. */
-object AdBlock {
-    private val HOSTS = setOf(
-        "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
-        "popads.net", "popcash.net", "propellerads.com", "onclickads.net", "adsterra.com", "exoclick.com",
-        "juicyads.com", "trafficjunky.net", "hilltopads.net", "a-ads.com", "adcash.com", "clickadu.com",
-        "mgid.com", "taboola.com", "outbrain.com", "revcontent.com", "zeropark.com", "adnxs.com", "yllix.com",
-        "popmyads.com", "richpush.co", "onclickalgo.com", "highperformanceformat.com",
-        "profitabledisplaynetwork.com", "adskeeper.com", "admaven.com", "ad-maven.com", "realsrv.com",
-        "tsyndicate.com", "galaksion.com", "monetag.com", "bidvertiser.com",
-    )
-
-    fun isBlocked(host: String): Boolean {
-        var h = host
-        while (h.isNotEmpty()) {
-            if (h in HOSTS) return true
-            val i = h.indexOf('.')
-            if (i < 0) return false
-            h = h.substring(i + 1)
-        }
-        return false
     }
 }
